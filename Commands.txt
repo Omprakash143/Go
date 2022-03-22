@@ -1,0 +1,8 @@
+go run main.go
+
+// To test the Go code
+go test -v
+
+// To get test coverage
+go test -cover
+go test -coverprofile=coverage.out && go tool cover -html=coverage.out
