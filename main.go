@@ -9,6 +9,7 @@ import (
 	"github.com/alexedwards/scs/v2"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/gorilla/websocket"
 )
 
 var session *scs.SessionManager
@@ -52,8 +53,13 @@ func getRoutes() *chi.Mux {
 	mux.Use(MiddleWareTest)
 	mux.Use(SessionMidlleware)
 
+	hub := newHub()
+	go hub.run()
 	mux.Get("/", Home)
 	mux.Post("/About", About)
+	mux.Get("/ws", func(w http.ResponseWriter, r *http.Request) {
+		wsAccess(hub, w, r)
+	})
 	return mux
 }
 
@@ -73,4 +79,124 @@ func About(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("Hello About Your ip is " + ip))
 	}
 	_, _ = fmt.Println(fmt.Sprintf("About - number of bytes is "))
+}
+
+// web socket ------
+
+var Upgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
+}
+
+// Endpoint to serve serving web-socket requests...
+func wsAccess(hub *Hub, w http.ResponseWriter, r *http.Request) {
+	// Upgrade HTTp/HTTPs connection to web-socket connection
+	Upgrader.CheckOrigin = func(r *http.Request) bool { return true }
+	ws, err := Upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		fmt.Println("Failed to created web-socket connection from HTTPs")
+		return
+	}
+	fmt.Println("Web-socket connected...")
+
+	client := &Client{
+		hub,
+		ws,
+		make(chan []byte, 256),
+	}
+	hub.Register <- client
+	fmt.Println("Client registered...")
+
+	go client.cliWS()
+	go client.serverWS()
+
+}
+
+// creating HUB to broadcast messages to clients
+
+type Hub struct {
+	Clients map[*Client]bool
+
+	Register chan *Client
+
+	Unregister chan *Client
+
+	Broadcast chan []byte
+}
+
+func newHub() *Hub {
+	return &Hub{
+		Clients:    make(map[*Client]bool),
+		Register:   make(chan *Client),
+		Unregister: make(chan *Client),
+		Broadcast:  make(chan []byte),
+	}
+}
+
+// creating clients
+
+type Client struct {
+	HubClient *Hub
+	WsConn    *websocket.Conn
+	Buffer    chan []byte
+}
+
+func (hub *Hub) run() {
+	fmt.Println("Hub started........")
+	for {
+		select {
+		case c := <-hub.Register:
+			hub.Clients[c] = true
+		case c1 := <-hub.Unregister:
+			delete(hub.Clients, c1)
+			close(c1.Buffer)
+		case msg := <-hub.Broadcast:
+			for cli, _ := range hub.Clients {
+				select {
+				case cli.Buffer <- msg:
+				default:
+					close(cli.Buffer)
+					delete(hub.Clients, cli)
+				}
+			}
+		}
+	}
+}
+
+func (cli *Client) cliWS() {
+	fmt.Println("Client started........")
+	defer func() {
+		cli.HubClient.Unregister <- cli
+		cli.WsConn.Close()
+	}()
+	for {
+		_, message, err := cli.WsConn.ReadMessage()
+		if err != nil {
+			fmt.Println("Failed to read data from Client")
+			cli.WsConn.Close()
+			break
+		}
+		cli.HubClient.Broadcast <- message
+	}
+}
+
+func (cli *Client) serverWS() {
+	fmt.Println("server started........")
+	defer func() {
+		cli.WsConn.Close()
+	}()
+	for {
+		select {
+		case message, ok := <-cli.Buffer:
+			if !ok {
+				cli.WsConn.WriteMessage(websocket.CloseMessage, []byte("Hub closed the channel..."))
+				return
+			}
+			err := cli.WsConn.WriteMessage(1, message)
+			if err != nil {
+				fmt.Println("Failed to write message to Client...")
+				break
+			}
+		}
+	}
 }
